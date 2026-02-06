@@ -1,0 +1,493 @@
+use clap::{Parser, Subcommand};
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::{env, fs};
+
+#[derive(Parser)]
+#[command(name = "cc-mcp-admin")]
+#[command(about = "Claude Code MCP Server Manager", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List all MCP servers across all projects
+    List,
+    /// Add an MCP server to the current project
+    Add {
+        /// Name of the MCP server to add
+        name: String,
+        /// Source project to copy configuration from (use partial path match)
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Remove an MCP server from the current project
+    Remove {
+        /// Name of the MCP server to remove
+        name: String,
+    },
+    /// Show details of a specific MCP server
+    Show {
+        /// Name of the MCP server
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpServer {
+    #[serde(rename = "type")]
+    server_type: Option<String>,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpJsonFile {
+    #[serde(rename = "mcpServers", default)]
+    mcp_servers: HashMap<String, McpServer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectConfig {
+    #[serde(rename = "mcpServers", default)]
+    mcp_servers: HashMap<String, McpServer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeJson {
+    #[serde(default)]
+    projects: HashMap<String, ProjectConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct McpEntry {
+    server: McpServer,
+    source_project: String,
+}
+
+fn get_claude_json_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude.json"))
+}
+
+fn load_claude_json() -> Option<ClaudeJson> {
+    let path = get_claude_json_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn find_mcp_json_files() -> Vec<PathBuf> {
+    let mut mcp_files = Vec::new();
+
+    // Get project paths from ~/.claude.json and check for .mcp.json in each
+    if let Some(claude_json) = load_claude_json() {
+        for project_path in claude_json.projects.keys() {
+            let mcp_path = PathBuf::from(project_path).join(".mcp.json");
+            if mcp_path.exists() {
+                mcp_files.push(mcp_path);
+            }
+        }
+    }
+
+    mcp_files
+}
+
+fn collect_all_mcp_servers() -> HashMap<String, Vec<McpEntry>> {
+    let mut all_servers: HashMap<String, Vec<McpEntry>> = HashMap::new();
+
+    // Load from ~/.claude.json
+    if let Some(claude_json) = load_claude_json() {
+        for (project_path, config) in claude_json.projects {
+            for (name, server) in config.mcp_servers {
+                let entry = McpEntry {
+                    server,
+                    source_project: project_path.clone(),
+                };
+                all_servers.entry(name).or_default().push(entry);
+            }
+        }
+    }
+
+    // Load from .mcp.json files
+    for mcp_path in find_mcp_json_files() {
+        if let Ok(content) = fs::read_to_string(&mcp_path) {
+            if let Ok(mcp_json) = serde_json::from_str::<McpJsonFile>(&content) {
+                let project_path = mcp_path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                for (name, server) in mcp_json.mcp_servers {
+                    let entry = McpEntry {
+                        server,
+                        source_project: project_path.clone(),
+                    };
+                    all_servers.entry(name).or_default().push(entry);
+                }
+            }
+        }
+    }
+
+    // Sort entries by source_project for deterministic order
+    for entries in all_servers.values_mut() {
+        entries.sort_by(|a, b| a.source_project.cmp(&b.source_project));
+    }
+
+    all_servers
+}
+
+fn get_current_project_mcp_servers() -> HashMap<String, McpServer> {
+    let cwd = env::current_dir().ok();
+    let cwd_str = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+
+    let mut servers = HashMap::new();
+
+    // Check ~/.claude.json for current project
+    if let (Some(claude_json), Some(cwd)) = (load_claude_json(), &cwd_str) {
+        if let Some(config) = claude_json.projects.get(cwd) {
+            servers.extend(config.mcp_servers.clone());
+        }
+    }
+
+    // Check local .mcp.json
+    if let Some(ref cwd_path) = cwd {
+        let mcp_json_path = cwd_path.join(".mcp.json");
+        if let Ok(content) = fs::read_to_string(&mcp_json_path) {
+            if let Ok(mcp_json) = serde_json::from_str::<McpJsonFile>(&content) {
+                servers.extend(mcp_json.mcp_servers);
+            }
+        }
+    }
+
+    servers
+}
+
+fn configs_differ(entries: &[McpEntry]) -> bool {
+    if entries.len() <= 1 {
+        return false;
+    }
+    let first = &entries[0].server;
+    entries.iter().skip(1).any(|e| {
+        e.server.command != first.command
+            || e.server.args != first.args
+            || e.server.env != first.env
+    })
+}
+
+fn list_mcp_servers() {
+    let all_servers = collect_all_mcp_servers();
+    let current_servers = get_current_project_mcp_servers();
+    let cwd = env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if all_servers.is_empty() {
+        println!("No MCP servers found across any projects.");
+        return;
+    }
+
+    println!("{}", "MCP Servers:".bold());
+    println!();
+
+    let mut names: Vec<_> = all_servers.keys().collect();
+    names.sort();
+
+    for name in names {
+        let entries = &all_servers[name];
+        let is_current = current_servers.contains_key(name);
+        let has_diff = configs_differ(entries);
+
+        let marker = if is_current {
+            "●".green().to_string()
+        } else {
+            "○".dimmed().to_string()
+        };
+
+        let diff_marker = if has_diff {
+            format!(" {}", "(multiple configs)".yellow())
+        } else {
+            String::new()
+        };
+
+        let name_display = if is_current {
+            name.green().bold().to_string()
+        } else {
+            name.to_string()
+        };
+
+        println!("  {} {}{}", marker, name_display, diff_marker);
+
+        // Show command (note if configs differ)
+        if let Some(entry) = entries.first() {
+            let cmd = &entry.server.command;
+            if has_diff {
+                println!("    {} {} {}", "command:".dimmed(), cmd, "(varies)".dimmed());
+            } else {
+                println!("    {} {}", "command:".dimmed(), cmd);
+            }
+        }
+
+        // Show projects using this server (sorted)
+        println!("    {}", "used in:".dimmed());
+        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        sorted_entries.sort_by_key(|e| &e.source_project);
+        for entry in sorted_entries {
+            let is_cwd = entry.source_project == cwd;
+            let short_path = shorten_path(&entry.source_project);
+            if is_cwd {
+                println!("      {} {}", "→".green(), format!("{} (current)", short_path).green());
+            } else {
+                println!("      - {}", short_path);
+            }
+        }
+        println!();
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Total: {} unique MCP servers across all projects",
+            all_servers.len()
+        )
+        .dimmed()
+    );
+    println!(
+        "{}",
+        format!("Current project: {} servers enabled", current_servers.len()).dimmed()
+    );
+}
+
+fn shorten_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path.starts_with(home_str.as_ref()) {
+            return path.replacen(home_str.as_ref(), "~", 1);
+        }
+    }
+    path.to_string()
+}
+
+fn show_mcp_server(name: &str) {
+    let all_servers = collect_all_mcp_servers();
+    let current_servers = get_current_project_mcp_servers();
+
+    match all_servers.get(name) {
+        Some(entries) => {
+            let is_current = current_servers.contains_key(name);
+            let status = if is_current {
+                "enabled in current project".green()
+            } else {
+                "not enabled in current project".yellow()
+            };
+
+            println!("{} {}", "MCP Server:".bold(), name.bold());
+            println!("  {} {}", "Status:".dimmed(), status);
+            println!();
+
+            for (i, entry) in entries.iter().enumerate() {
+                println!(
+                    "  {} {}",
+                    format!("Configuration #{}:", i + 1).bold(),
+                    shorten_path(&entry.source_project).dimmed()
+                );
+                println!("    {} {}", "command:".dimmed(), entry.server.command);
+                if !entry.server.args.is_empty() {
+                    println!("    {} {:?}", "args:".dimmed(), entry.server.args);
+                }
+                if !entry.server.env.is_empty() {
+                    println!("    {} {:?}", "env:".dimmed(), entry.server.env);
+                }
+                println!();
+            }
+        }
+        None => {
+            eprintln!("{} MCP server '{}' not found", "Error:".red(), name);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn add_mcp_server(name: &str, from: Option<&str>) {
+    let all_servers = collect_all_mcp_servers();
+    let current_servers = get_current_project_mcp_servers();
+    let cwd = env::current_dir().expect("Failed to get current directory");
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    if current_servers.contains_key(name) {
+        println!(
+            "{} MCP server '{}' is already enabled in this project",
+            "Note:".yellow(),
+            name
+        );
+        return;
+    }
+
+    let entries = match all_servers.get(name) {
+        Some(e) => e,
+        None => {
+            eprintln!(
+                "{} MCP server '{}' not found in any project",
+                "Error:".red(),
+                name
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Select configuration based on --from option or show options if multiple exist
+    let entry = if let Some(from_pattern) = from {
+        match entries.iter().find(|e| e.source_project.contains(from_pattern)) {
+            Some(e) => e,
+            None => {
+                eprintln!(
+                    "{} No configuration found matching '{}'",
+                    "Error:".red(),
+                    from_pattern
+                );
+                eprintln!("Available configurations:");
+                for e in entries {
+                    eprintln!("  - {}", shorten_path(&e.source_project));
+                }
+                std::process::exit(1);
+            }
+        }
+    } else if entries.len() > 1 {
+        eprintln!(
+            "{} Multiple configurations found for '{}'. Use --from to specify:",
+            "Error:".red(),
+            name
+        );
+        for e in entries {
+            eprintln!("  {} {}", "→".dimmed(), shorten_path(&e.source_project));
+        }
+        eprintln!();
+        eprintln!("Example: cc-mcp-admin add {} --from votingmachine", name);
+        std::process::exit(1);
+    } else {
+        &entries[0]
+    };
+
+    let mut server = entry.server.clone();
+
+    // Update project path in args if this is a serena-style server
+    for arg in &mut server.args {
+        if arg.contains(&entry.source_project) {
+            *arg = arg.replace(&entry.source_project, &cwd_str);
+        }
+    }
+
+    // Update to ~/.claude.json
+    let claude_json_path = get_claude_json_path().expect("Failed to get claude.json path");
+    let content = fs::read_to_string(&claude_json_path).expect("Failed to read ~/.claude.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).expect("Failed to parse ~/.claude.json");
+
+    // Ensure projects object exists
+    if json.get("projects").is_none() {
+        json["projects"] = serde_json::json!({});
+    }
+
+    // Ensure current project exists
+    if json["projects"].get(&cwd_str).is_none() {
+        json["projects"][&cwd_str] = serde_json::json!({
+            "mcpServers": {}
+        });
+    }
+
+    // Ensure mcpServers exists
+    if json["projects"][&cwd_str].get("mcpServers").is_none() {
+        json["projects"][&cwd_str]["mcpServers"] = serde_json::json!({});
+    }
+
+    // Add the server
+    json["projects"][&cwd_str]["mcpServers"][name] = serde_json::to_value(&server).unwrap();
+
+    // Write back
+    let new_content = serde_json::to_string_pretty(&json).expect("Failed to serialize JSON");
+    fs::write(&claude_json_path, new_content).expect("Failed to write ~/.claude.json");
+
+    println!(
+        "{} Added MCP server '{}' to current project",
+        "✓".green(),
+        name.green().bold()
+    );
+    println!("  {} {}", "command:".dimmed(), server.command);
+    if !server.args.is_empty() {
+        println!("  {} {:?}", "args:".dimmed(), server.args);
+    }
+}
+
+fn remove_mcp_server(name: &str) {
+    let current_servers = get_current_project_mcp_servers();
+    let cwd = env::current_dir().expect("Failed to get current directory");
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    if !current_servers.contains_key(name) {
+        eprintln!(
+            "{} MCP server '{}' is not enabled in this project",
+            "Error:".red(),
+            name
+        );
+        std::process::exit(1);
+    }
+
+    // Check if it's in local .mcp.json
+    let mcp_json_path = cwd.join(".mcp.json");
+    if mcp_json_path.exists() {
+        if let Ok(content) = fs::read_to_string(&mcp_json_path) {
+            if let Ok(mcp_json) = serde_json::from_str::<McpJsonFile>(&content) {
+                if mcp_json.mcp_servers.contains_key(name) {
+                    println!(
+                        "{} MCP server '{}' is defined in local .mcp.json",
+                        "Note:".yellow(),
+                        name
+                    );
+                    println!("  Please remove it manually from .mcp.json");
+                    return;
+                }
+            }
+        }
+    }
+
+    // Remove from ~/.claude.json
+    let claude_json_path = get_claude_json_path().expect("Failed to get claude.json path");
+    let content = fs::read_to_string(&claude_json_path).expect("Failed to read ~/.claude.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).expect("Failed to parse ~/.claude.json");
+
+    if let Some(mcp_servers) = json
+        .get_mut("projects")
+        .and_then(|p| p.get_mut(&cwd_str))
+        .and_then(|c| c.get_mut("mcpServers"))
+        .and_then(|m| m.as_object_mut())
+    {
+        mcp_servers.remove(name);
+    }
+
+    let new_content = serde_json::to_string_pretty(&json).expect("Failed to serialize JSON");
+    fs::write(&claude_json_path, new_content).expect("Failed to write ~/.claude.json");
+
+    println!(
+        "{} Removed MCP server '{}' from current project",
+        "✓".green(),
+        name.green().bold()
+    );
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::List) | None => list_mcp_servers(),
+        Some(Commands::Add { name, from }) => add_mcp_server(&name, from.as_deref()),
+        Some(Commands::Remove { name }) => remove_mcp_server(&name),
+        Some(Commands::Show { name }) => show_mcp_server(&name),
+    }
+}
