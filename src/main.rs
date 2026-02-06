@@ -11,6 +11,10 @@ use std::{env, fs};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// MCP server name to show (shorthand for 'show <name>')
+    #[arg(conflicts_with = "command")]
+    name: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -168,15 +172,25 @@ fn get_current_project_mcp_servers() -> HashMap<String, McpServer> {
     servers
 }
 
+/// Normalize args by replacing project-specific paths with a placeholder
+fn normalize_args(args: &[String], project_path: &str) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.replace(project_path, "<PROJECT>"))
+        .collect()
+}
+
 fn configs_differ(entries: &[McpEntry]) -> bool {
     if entries.len() <= 1 {
         return false;
     }
-    let first = &entries[0].server;
+    let first = &entries[0];
+    let first_args = normalize_args(&first.server.args, &first.source_project);
+
     entries.iter().skip(1).any(|e| {
-        e.server.command != first.command
-            || e.server.args != first.args
-            || e.server.env != first.env
+        let args = normalize_args(&e.server.args, &e.source_project);
+        e.server.command != first.server.command
+            || args != first_args
+            || e.server.env != first.server.env
     })
 }
 
@@ -291,18 +305,61 @@ fn show_mcp_server(name: &str) {
             println!("  {} {}", "Status:".dimmed(), status);
             println!();
 
+            // Use first entry as baseline for comparison
+            let baseline = &entries[0];
+            let baseline_args = normalize_args(&baseline.server.args, &baseline.source_project);
+
             for (i, entry) in entries.iter().enumerate() {
                 println!(
                     "  {} {}",
                     format!("Configuration #{}:", i + 1).bold(),
                     shorten_path(&entry.source_project).dimmed()
                 );
-                println!("    {} {}", "command:".dimmed(), entry.server.command);
+
+                // Highlight command if different from baseline
+                let cmd_display = if i > 0 && entry.server.command != baseline.server.command {
+                    entry.server.command.yellow().to_string()
+                } else {
+                    entry.server.command.clone()
+                };
+                println!("    {} {}", "command:".dimmed(), cmd_display);
+
+                // Highlight args differences
                 if !entry.server.args.is_empty() {
-                    println!("    {} {:?}", "args:".dimmed(), entry.server.args);
+                    let normalized = normalize_args(&entry.server.args, &entry.source_project);
+                    if i > 0 && normalized != baseline_args {
+                        // Show args with differences highlighted
+                        let highlighted: Vec<String> = entry
+                            .server
+                            .args
+                            .iter()
+                            .zip(normalized.iter())
+                            .enumerate()
+                            .map(|(j, (orig, norm))| {
+                                let baseline_norm = baseline_args.get(j);
+                                if baseline_norm != Some(norm) {
+                                    format!("\"{}\"", orig).yellow().to_string()
+                                } else {
+                                    format!("\"{}\"", orig)
+                                }
+                            })
+                            .collect();
+                        println!("    {} [{}]", "args:".dimmed(), highlighted.join(", "));
+                    } else {
+                        println!("    {} {:?}", "args:".dimmed(), entry.server.args);
+                    }
                 }
+
+                // Highlight env if different from baseline
                 if !entry.server.env.is_empty() {
-                    println!("    {} {:?}", "env:".dimmed(), entry.server.env);
+                    if i > 0 && entry.server.env != baseline.server.env {
+                        println!("    {} {}", "env:".dimmed(), format!("{:?}", entry.server.env).yellow());
+                    } else {
+                        println!("    {} {:?}", "env:".dimmed(), entry.server.env);
+                    }
+                } else if i > 0 && !baseline.server.env.is_empty() {
+                    // Baseline has env but this one doesn't
+                    println!("    {} {}", "env:".dimmed(), "(none)".yellow());
                 }
                 println!();
             }
@@ -483,6 +540,12 @@ fn remove_mcp_server(name: &str) {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Handle shorthand: cc-mcp-admin <name> => cc-mcp-admin show <name>
+    if let Some(name) = cli.name {
+        show_mcp_server(&name);
+        return;
+    }
 
     match cli.command {
         Some(Commands::List) | None => list_mcp_servers(),
