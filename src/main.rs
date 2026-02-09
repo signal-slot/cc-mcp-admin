@@ -13,7 +13,6 @@ struct Cli {
     command: Option<Commands>,
 
     /// MCP server name to show (shorthand for 'show <name>')
-    #[arg(conflicts_with = "command")]
     name: Option<String>,
 }
 
