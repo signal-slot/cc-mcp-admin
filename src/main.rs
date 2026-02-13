@@ -44,11 +44,26 @@ enum Commands {
 struct McpServer {
     #[serde(rename = "type")]
     server_type: Option<String>,
-    command: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+}
+
+impl McpServer {
+    fn display_target(&self) -> &str {
+        if let Some(ref cmd) = self.command {
+            cmd
+        } else if let Some(ref url) = self.url {
+            url
+        } else {
+            "(unknown)"
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +203,7 @@ fn configs_differ(entries: &[McpEntry]) -> bool {
     entries.iter().skip(1).any(|e| {
         let args = normalize_args(&e.server.args, &e.source_project);
         e.server.command != first.server.command
+            || e.server.url != first.server.url
             || args != first_args
             || e.server.env != first.server.env
     })
@@ -237,13 +253,14 @@ fn list_mcp_servers() {
 
         println!("  {} {}{}", marker, name_display, diff_marker);
 
-        // Show command (note if configs differ)
+        // Show command/url (note if configs differ)
         if let Some(entry) = entries.first() {
-            let cmd = &entry.server.command;
+            let target = entry.server.display_target();
+            let label = if entry.server.url.is_some() { "url:" } else { "command:" };
             if has_diff {
-                println!("    {} {} {}", "command:".dimmed(), cmd, "(varies)".dimmed());
+                println!("    {} {} {}", label.dimmed(), target, "(varies)".dimmed());
             } else {
-                println!("    {} {}", "command:".dimmed(), cmd);
+                println!("    {} {}", label.dimmed(), target);
             }
         }
 
@@ -315,13 +332,22 @@ fn show_mcp_server(name: &str) {
                     shorten_path(&entry.source_project).dimmed()
                 );
 
-                // Highlight command if different from baseline
-                let cmd_display = if i > 0 && entry.server.command != baseline.server.command {
-                    entry.server.command.yellow().to_string()
-                } else {
-                    entry.server.command.clone()
-                };
-                println!("    {} {}", "command:".dimmed(), cmd_display);
+                // Highlight command/url if different from baseline
+                if let Some(ref cmd) = entry.server.command {
+                    let cmd_display = if i > 0 && entry.server.command != baseline.server.command {
+                        cmd.yellow().to_string()
+                    } else {
+                        cmd.clone()
+                    };
+                    println!("    {} {}", "command:".dimmed(), cmd_display);
+                } else if let Some(ref url) = entry.server.url {
+                    let url_display = if i > 0 && entry.server.url != baseline.server.url {
+                        url.yellow().to_string()
+                    } else {
+                        url.clone()
+                    };
+                    println!("    {} {}", "url:".dimmed(), url_display);
+                }
 
                 // Highlight args differences
                 if !entry.server.args.is_empty() {
@@ -474,7 +500,11 @@ fn add_mcp_server(name: &str, from: Option<&str>) {
         "✓".green(),
         name.green().bold()
     );
-    println!("  {} {}", "command:".dimmed(), server.command);
+    if let Some(ref cmd) = server.command {
+        println!("  {} {}", "command:".dimmed(), cmd);
+    } else if let Some(ref url) = server.url {
+        println!("  {} {}", "url:".dimmed(), url);
+    }
     if !server.args.is_empty() {
         println!("  {} {:?}", "args:".dimmed(), server.args);
     }
