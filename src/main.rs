@@ -440,7 +440,7 @@ fn add_mcp_server(name: &str, from: Option<&str>) {
                 std::process::exit(1);
             }
         }
-    } else if entries.len() > 1 {
+    } else if entries.len() > 1 && configs_differ(entries) {
         eprintln!(
             "{} Multiple configurations found for '{}'. Use --from to specify:",
             "Error:".red(),
